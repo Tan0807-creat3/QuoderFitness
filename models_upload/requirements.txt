@@ -1,0 +1,2 @@
+numpy
+# torch  # bat neu muon su dung torch / GPU (pip install torch)

@@ -1,0 +1,5 @@
+numpy
+torch
+kagglehub
+# Tren VPS co GPU NVIDIA, cai torch CUDA thay the:
+# pip install torch --index-url https://download.pytorch.org/whl/cu124
