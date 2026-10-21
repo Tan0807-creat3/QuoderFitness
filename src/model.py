@@ -8,6 +8,12 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+try:
+    import torch_xla.core.xla_model as xm
+    XLA_AVAILABLE = True
+except ImportError:
+    XLA_AVAILABLE = False
+
 
 def activate(Z, act):
     if act == "relu":
@@ -106,15 +112,29 @@ class TorchBackend:
         self.cfg = cfg
         perf = cfg.get("performance", {})
         device_name = cfg.get("training", {}).get("device", "cpu")
-        if device_name == "cuda" and torch.cuda.is_available():
+
+        # Uu tien: TPU (XLA) > CUDA > CPU
+        if device_name == "tpu" and XLA_AVAILABLE:
+            try:
+                self.device = xm.xla_device()
+                self.name = "torch (tpu/xla)"
+                self._is_tpu = True
+            except Exception:
+                self.device = torch.device("cpu")
+                self.name = "torch (cpu, fallback from tpu)"
+                self._is_tpu = False
+        elif device_name == "cuda" and torch.cuda.is_available():
             self.device = torch.device("cuda")
             self.name = "torch (cuda)"
+            self._is_tpu = False
         elif device_name == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
             self.device = torch.device("xpu")
             self.name = "torch (xpu)"
+            self._is_tpu = False
         else:
             self.device = torch.device("cpu")
             self.name = "torch (cpu, mkldnn)"
+            self._is_tpu = False
             try:
                 torch.set_num_threads(perf.get("num_threads", 8))
                 torch.set_num_interop_threads(perf.get("interop_threads", 4))
@@ -124,6 +144,7 @@ class TorchBackend:
                     torch.use_deterministic_algorithms(True, warn_only=True)
             except Exception:
                 pass
+
         self.shared = None
         self.heads = None
         self.task_configs = None
@@ -159,6 +180,9 @@ class TorchBackend:
         self.built = True
 
     def to_numpy(self, tensor):
+        if self._is_tpu:
+            import torch_xla.core.xla_model as xm
+            return tensor.cpu().detach().numpy()
         return tensor.detach().cpu().numpy()
 
     def predict(self, X):
@@ -166,6 +190,8 @@ class TorchBackend:
         X = np.array(X, dtype=np.float32)
         if X.ndim == 1:
             X = X.reshape(1, -1)
+        elif X.ndim == 0:
+            X = X.reshape(1, 1)
         Xt = t.tensor(X, dtype=t.float32, device=self.device)
         with t.no_grad():
             A = self.shared(Xt)
@@ -181,6 +207,9 @@ class TorchBackend:
             optimizer="adam", weight_decay=0.0, lr_schedule="cosine",
             batch_size=256, warmup_epochs=10, accumulation_steps=1):
         t = self.torch
+        if self._is_tpu:
+            import torch_xla.core.xla_model as xm
+
         Xt = t.tensor(X, dtype=t.float32, device=self.device)
         y_ts = {k: t.tensor(v, dtype=t.float32, device=self.device) for k, v in y_dict.items()}
 
@@ -208,7 +237,7 @@ class TorchBackend:
             else:
                 labels[name] = y_ts[name]
 
-        scaler = t.cuda.amp.GradScaler() if self.device.type == "cuda" and cfg.get("training", {}).get("mixed_precision", False) else None
+        scaler = None
 
         task_loss_ema = {name: 1.0 for name in self.task_order}
         ema_alpha = 0.98
@@ -239,8 +268,11 @@ class TorchBackend:
                     total_loss = total_loss + self._task_weights[name] * norm_loss
 
                 total_loss.backward()
-                t.nn.utils.clip_grad_norm_(params, clip)
-                opt.step()
+                if self._is_tpu:
+                    xm.optimizer_step(opt)
+                else:
+                    t.nn.utils.clip_grad_norm_(params, clip)
+                    opt.step()
 
                 total_loss += total_loss.item()
                 nb += 1
@@ -289,9 +321,14 @@ class QoderFitness:
 
         if backend is None:
             import torch
-            backend = "cuda" if torch.cuda.is_available() else "cpu"
+            if XLA_AVAILABLE:
+                backend = "tpu"
+            elif torch.cuda.is_available():
+                backend = "cuda"
+            else:
+                backend = "cpu"
 
-        if backend in ("cuda", "xpu", "gpu"):
+        if backend in ("tpu", "cuda", "xpu", "gpu"):
             self.backend_name = "torch"
             self.backend = TorchBackend(self.cfg) if TORCH_AVAILABLE else None
         elif backend in ("cpu", "torch"):
@@ -301,7 +338,7 @@ class QoderFitness:
             self.backend_name = "numpy"
             self.backend = None
         else:
-            raise ValueError("backend phai la 'numpy', 'torch', 'cpu', 'cuda' hoac 'xpu'")
+            raise ValueError("backend phai la 'numpy', 'torch', 'cpu', 'cuda', 'tpu' hoac 'xpu'")
 
         self.arch = self.cfg["architecture"]
         self.train_cfg = self.cfg["training"]
@@ -551,7 +588,6 @@ class QoderFitness:
         with open(path, "r", encoding="utf-8") as f:
             data = _json.load(f)
         model = cls(config_path=config_path, backend=backend)
-        # Reset cac layer da tao boi _build_from_config de load dung tu JSON
         model.shared_layers = []
         model.task_heads = {}
         model.task_order = []

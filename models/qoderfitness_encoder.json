@@ -5,7 +5,7 @@
     "model_info": {
       "name": "QoderFitness",
       "version": "2.1.0",
-      "description": "test",
+      "description": "test tpu support",
       "author": "Qoder",
       "created": "2026-10-20",
       "framework": "PyTorch + NumPy",
