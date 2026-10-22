@@ -1,0 +1,81 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+import json
+from src.model import QoderFitness
+from src.data import generate_multitask_dataset, train_test_split
+from src.utils import (
+    save_scaler, accuracy_onehot, rmse, compute_score, set_seed, configure_performance, setup_logger
+)
+
+
+def train_model(config_path="configs/model_config.json"):
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    set_seed(cfg["training"]["seed"])
+    configure_performance(cfg.get("training", {}).get("device", "cpu"), cfg)
+    logger = setup_logger("qoderfitness", cfg.get("paths", {}).get("log_dir", "logs"))
+
+    data_cfg = cfg["data"]
+    X, y = generate_multitask_dataset(
+        n_samples=data_cfg["n_samples"], seed=cfg["training"]["seed"]
+    )
+    X_train, y_train, X_test, y_test = train_test_split(
+        X, y, test_ratio=data_cfg["test_ratio"], seed=cfg["training"]["seed"]
+    )
+
+    X_mean = X_train.mean(axis=0)
+    X_std = X_train.std(axis=0) + 1e-6
+    X_train_n = (X_train - X_mean) / X_std
+    X_test_n = (X_test - X_mean) / X_std
+
+    backend = cfg.get("training", {}).get("device", "cpu")
+    model = QoderFitness(config_path=config_path, backend=backend)
+    model.summary()
+
+    best = float("inf")
+    patience = cfg["training"]["early_stopping"]["patience"]
+    min_delta = cfg["training"]["early_stopping"]["min_delta"]
+    wait = 0
+
+    for epoch in range(cfg["training"]["epochs"]):
+        model.fit(X_train_n, y_train, verbose=False)
+        outs = model.predict(X_test_n)
+
+        aA = accuracy_onehot(outs["A"], y_test["A"])
+        aB = accuracy_onehot(outs["B"], y_test["B"])
+        rC = rmse(outs["C"], y_test["C"])
+        aD = accuracy_onehot(outs["D"], y_test["D"])
+
+        if epoch % 25 == 0 or epoch == cfg["training"]["epochs"] - 1:
+            msg = (f"Epoch {epoch+1:4d}/{cfg['training']['epochs']} | "
+                   f"A:{aA:.4f} B:{aB:.4f} C(rmse):{rC:.4f} D:{aD:.4f}")
+            print(msg)
+            logger.info(msg)
+
+        score = compute_score(aA, aB, rC, aD)
+        if score < best - min_delta:
+            best = score
+            wait = 0
+            model.save(cfg.get("paths", {}).get("model_save", "models/qoderfitness_best.json"))
+        else:
+            wait += 1
+            if wait >= patience:
+                msg = f"Early stopping at epoch {epoch+1}"
+                print(msg)
+                logger.info(msg)
+                break
+
+    save_scaler(X_mean, X_std, cfg.get("paths", {}).get("scaler_save", "models/x_scaler.npz"))
+    model.save_encoder(cfg.get("paths", {}).get("encoder_save", "models/qoderfitness_encoder.json"))
+    print(f"Da luu qoderfitness_best.json | best score {best:.4f}")
+    print(f"Da luu encoder vao qoderfitness_encoder.json")
+    logger.info(f"Training complete. Best score: {best:.4f}")
+    return model, best
+
+
+if __name__ == "__main__":
+    train_model()
